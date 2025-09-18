@@ -4,7 +4,6 @@ import os
 import time
 from pathlib import Path
 from typing import Optional
-import queue
 
 from telegram import Update, Message
 from telegram.ext import (
@@ -26,10 +25,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Глобальная очередь обработки для отслеживания нагрузки
-processing_queue = asyncio.Queue()
-active_processes = {}
-
 
 class VideoBot:
     """Телеграм бот для сжатия видео с добавлением случайных рамок"""
@@ -45,7 +40,6 @@ class VideoBot:
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("stats", self.stats_command))
-        self.application.add_handler(CommandHandler("queue", self.queue_command))
         
         # Обработка видео файлов
         self.application.add_handler(
@@ -82,15 +76,7 @@ MP4, AVI, MOV, MKV, WEBM, FLV и другие
 • Уникальные рамки разной толщины для каждого варианта
 • 20 разных цветов рамок (случайный выбор)
 • Размер всегда 1080x1920 (Stories)
-• Оптимизирован для скорости обработки
-
-⚡ *Новое:*
-• Быстрая обработка (preset: fast)
-• Параллельная обработка нескольких видео
-• Система очередей для справедливого распределения
-
-🕐 *Время обработки:* 1-3 минуты
-📋 *Команды:* /queue - проверить очередь
+• Визуально лossless качество
 
 Отправь видео и получи 6 уникальных вариантов! 🚀
         """
@@ -112,7 +98,6 @@ MP4, AVI, MOV, MKV, WEBM, FLV и другие
 /start - Начать работу с ботом
 /help - Показать эту справку
 /stats - Статистика обработки
-/queue - Проверить очередь обработки
 
 📐 *Что получаешь:*
 • 6 вариантов одного видео
@@ -126,22 +111,17 @@ MP4, AVI, MOV, MKV, WEBM, FLV и другие
 • Максимальный размер: 20MB (лимит Telegram Bot API)
 • Поддерживаемые форматы: {formats}
 
-⚡ *Производительность:*
-• Оптимизировано для скорости (preset: fast)
-• Параллельная обработка
-• Время: 1-3 минуты для коротких видео
-
 💡 *Советы:*
 • Файлы до 20MB обрабатываются надёжно
-• Короткие видео (до 30 сек) обрабатываются быстрее
-• При большой очереди используйте /queue для проверки
+• Для больших файлов используйте сжатие перед отправкой
+• Telegram getFile API имеет жёсткий лимит 20MB
 
 🔧 *Технические особенности:*
 • 6 настроек качества: от максимального до ультра-компактного
 • Толщина рамок: от 10px до 150px (7 вариантов)
 • Кодек H.264 с разными CRF (18-30)
-• Bitrate от 500k до 2500k
-• Многопоточная обработка FFmpeg
+• Bitrate от 400k до 2500k
+• Сохранение аудио в высоком качестве
         """.format(
             max_size=settings.max_file_size_mb,
             formats=", ".join(sorted(SUPPORTED_VIDEO_FORMATS))
@@ -154,9 +134,6 @@ MP4, AVI, MOV, MKV, WEBM, FLV и другие
     
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /stats"""
-        queue_size = processing_queue.qsize()
-        active_count = len(active_processes)
-        
         stats_message = """
 📊 *Статистика VideoBot*
 
@@ -168,15 +145,7 @@ MP4, AVI, MOV, MKV, WEBM, FLV и другие
 • Максимальный размер: {max_size}MB
 • Поддерживаемых форматов: {formats_count}
 
-🚀 *Производительность:*
-• Режим: Параллельная обработка
-• FFmpeg preset: fast/faster
-• Многопоточность: включена
-
-📈 *Текущая нагрузка:*
-• В очереди: {queue_size} видео
-• Обрабатывается: {active_count} видео
-• Статус: {"🟢 Свободен" if queue_size == 0 else "🟡 Обрабатывает" if queue_size < 3 else "🔴 Высокая нагрузка"}
+🎲 *Доступных соотношений сторон:* {ratios_count}
 
 Bot работает стабильно! ✅
         """.format(
@@ -184,39 +153,13 @@ Bot работает стабильно! ✅
             output_dir=settings.output_dir,
             max_size=settings.max_file_size_mb,
             formats_count=len(SUPPORTED_VIDEO_FORMATS),
-            queue_size=queue_size,
-            active_count=active_count
+            ratios_count=len(video_processor.calculate_resize_params.__code__.co_names)
         )
         
         await update.message.reply_text(
             stats_message, 
             parse_mode='Markdown'
         )
-    
-    async def queue_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /queue"""
-        user_id = update.message.from_user.id
-        queue_size = processing_queue.qsize()
-        active_count = len(active_processes)
-        user_in_queue = user_id in active_processes
-        
-        if queue_size == 0 and active_count == 0:
-            status_msg = "🟢 *Очередь пуста!* Отправляйте видео - обработка начнется немедленно."
-        elif user_in_queue:
-            status_msg = f"⚡ *Ваше видео обрабатывается!*\n\n📊 Активных процессов: {active_count}"
-        else:
-            estimated_time = queue_size * 2  # Примерно 2 минуты на видео
-            status_msg = f"""
-📋 *Состояние очереди:*
-
-🔄 В очереди: {queue_size} видео
-⚡ Обрабатывается: {active_count} видео
-⏱ Примерное время ожидания: {estimated_time} мин
-
-{get_queue_status_emoji(queue_size)} Статус: {get_queue_status_text(queue_size)}
-            """
-        
-        await update.message.reply_text(status_msg, parse_mode='Markdown')
     
     async def handle_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик видео файлов"""
@@ -238,10 +181,6 @@ Bot работает стабильно! ✅
                 f"💡 Уменьшите размер файла до 50MB или меньше"
             )
             return
-        
-        # Добавляем информацию об очереди
-        queue_size = processing_queue.qsize()
-        estimated_time = (queue_size + 1) * 2  # Примерно 2 минуты на видео
         
         # Сразу обрабатываем видео с 6 вариантами
         await self.process_video_file(message, context, video.file_id, 
@@ -281,45 +220,24 @@ Bot работает стабильно! ✅
     
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик текстовых сообщений"""
-        queue_size = processing_queue.qsize()
-        
         await update.message.reply_text(
-            f"🎬 Отправь мне видео файл!\n\n"
-            f"📱 Простой процесс:\n"
-            f"1️⃣ Отправляешь видео\n"
-            f"2️⃣ Получаешь сразу 6 разных вариантов!\n\n"
-            f"✅ Каждый вариант с уникальной рамкой\n"
-            f"✅ Разные размеры файлов\n"
-            f"✅ Все в формате 1080x1920 (Stories)\n"
-            f"⚡ Оптимизированная скорость обработки\n\n"
-            f"📊 Текущая очередь: {queue_size} видео\n"
-            f"⏱ Время обработки: ~2-3 минуты\n\n"
-            f"Используй /help для получения справки или /queue для проверки очереди."
+            "🎬 Отправь мне видео файл!\n\n"
+            "📱 Простой процесс:\n"
+            "1️⃣ Отправляешь видео\n"
+            "2️⃣ Получаешь сразу 6 разных вариантов!\n\n"
+            "✅ Каждый вариант с уникальной рамкой\n"
+            "✅ Разные размеры файлов\n"
+            "✅ Все в формате 1080x1920 (Stories)\n\n"
+            "Используй /help для получения справки."
         )
     
     async def process_video_file(self, message: Message, context: ContextTypes.DEFAULT_TYPE, file_id: str, filename: str, variant_count: int = 6):
-        """Основная функция обработки видео с системой очередей"""
+        """Основная функция обработки видео"""
         user_id = message.from_user.id
         logger.info(f"Начинаю обработку видео для пользователя {user_id}, файл: {filename}")
         
-        # Добавляем в очередь и отслеживание
-        await processing_queue.put((user_id, file_id, filename))
-        active_processes[user_id] = {
-            'filename': filename,
-            'start_time': time.time(),
-            'message_id': message.message_id
-        }
-        
-        queue_position = processing_queue.qsize()
-        estimated_wait = queue_position * 2  # 2 минуты на видео
-        
-        # Уведомляем пользователя о начале обработки с информацией об очереди
-        if queue_position <= 1:
-            status_msg = "🎬 Начинаю обработку видео...\n⚡ Оптимизированная обработка включена!"
-        else:
-            status_msg = f"📋 Видео добавлено в очередь!\n\n📊 Позиция в очереди: {queue_position}\n⏱ Примерное время ожидания: {estimated_wait} мин\n⚡ Используется быстрая обработка"
-        
-        progress_message = await message.reply_text(status_msg)
+        # Уведомляем пользователя о начале обработки
+        await message.reply_text("🎬 Начинаю обработку видео...")
         
         # Показываем индикатор "загрузка видео"
         await message.chat.send_action(ChatAction.UPLOAD_VIDEO)
@@ -330,18 +248,8 @@ Bot работает стабильно! ✅
         temp_output_path = settings.output_dir / f"{user_id}_{timestamp}_output.mp4"
         
         try:
-            # Ждем нашей очереди
-            while True:
-                current_user, current_file_id, current_filename = await processing_queue.get()
-                if current_user == user_id and current_file_id == file_id:
-                    break
-                else:
-                    # Возвращаем в очередь если это не наш файл
-                    await processing_queue.put((current_user, current_file_id, current_filename))
-                    await asyncio.sleep(1)
-            
-            # Обновляем статус
-            await progress_message.edit_text("📥 Скачиваю видео...\n⚡ Быстрая обработка активна!")
+            # Скачиваем файл
+            progress_message = await message.reply_text("📥 Скачиваю видео...")
             
             try:
                 file = await context.bot.get_file(file_id)
@@ -429,14 +337,14 @@ Bot работает стабильно! ✅
                     )
                 return
             
-            await progress_message.edit_text(f"🔄 Обрабатываю видео...\n⚡ Быстрая обработка (preset: fast)\n🎯 Создаю {variant_count} вариантов...")
+            await progress_message.edit_text("🔄 Обрабатываю видео...")
             
             # Получаем информацию о видео
             video_info = await video_processor.get_video_info(temp_input_path)
             input_size_mb = temp_input_path.stat().st_size / (1024 * 1024)
             
-            # Всегда создаем 6 вариантов с оптимизацией
-            await progress_message.edit_text(f"🔄 Создаю {variant_count} вариантов видео...\n⚡ Оптимизированная обработка\n🏁 preset: fast/faster для ускорения")
+            # Всегда создаем 6 вариантов
+            await progress_message.edit_text(f"🔄 Создаю {variant_count} вариантов видео...")
             
             variants = await video_processor.create_multiple_variants(
                 temp_input_path, 
@@ -463,8 +371,7 @@ Bot работает стабильно! ✅
                                    f"📁 Размер: {variant['size_mb']:.1f}MB\n"
                                    f"🎯 Качество: CRF {variant['quality']}\n"
                                    f"🎨 Цвет рамки: {variant['frame_color']}\n"
-                                   f"🖼 Толщина рамки: {variant['frame_thickness']} ({variant['frame_thickness_px']}px)\n"
-                                   f"⚡ Оптимизировано для скорости",
+                                   f"🖼 Толщина рамки: {variant['frame_thickness']} ({variant['frame_thickness_px']}px)",
                             supports_streaming=True,
                             read_timeout=60,
                             write_timeout=60
@@ -481,17 +388,6 @@ Bot работает стабильно! ✅
             
             # Удаляем сообщение о прогрессе и завершаем
             await progress_message.delete()
-            
-            # Отправляем финальное сообщение
-            processing_time = time.time() - active_processes[user_id]['start_time']
-            await message.reply_text(
-                f"🎉 Обработка завершена!\n\n"
-                f"⏱ Время обработки: {processing_time:.1f} сек\n"
-                f"📹 Создано вариантов: {len(variants)}\n"
-                f"⚡ Использована оптимизация скорости\n\n"
-                f"Отправьте еще видео для обработки! 🚀"
-            )
-            
             return
             
         except Exception as e:
@@ -505,11 +401,6 @@ Bot работает стабильно! ✅
             await asyncio.sleep(0.5)
             # Очищаем временные файлы
             video_processor.cleanup_temp_files(temp_input_path, temp_output_path)
-            # Удаляем из активных процессов
-            if user_id in active_processes:
-                del active_processes[user_id]
-            # Отмечаем задачу как выполненную
-            processing_queue.task_done()
     
     async def run(self):
         """Запуск бота"""
@@ -541,26 +432,6 @@ Bot работает стабильно! ✅
             await self.application.updater.stop()
             await self.application.stop()
             await self.application.shutdown()
-
-
-def get_queue_status_emoji(queue_size: int) -> str:
-    """Возвращает эмодзи статуса очереди"""
-    if queue_size == 0:
-        return "🟢"
-    elif queue_size <= 2:
-        return "🟡"
-    else:
-        return "🔴"
-
-
-def get_queue_status_text(queue_size: int) -> str:
-    """Возвращает текст статуса очереди"""
-    if queue_size == 0:
-        return "Свободен"
-    elif queue_size <= 2:
-        return "Небольшая очередь"
-    else:
-        return "Высокая нагрузка"
 
 
 async def main():

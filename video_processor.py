@@ -131,7 +131,6 @@ class VideoProcessor:
                                       target_height: Optional[int] = None) -> dict:
         """
         Сжимает видео без потери качества и применяет случайные рамки
-        ОПТИМИЗИРОВАНО ДЛЯ СКОРОСТИ
         """
         try:
             # Получаем информацию о исходном видео
@@ -155,7 +154,7 @@ class VideoProcessor:
             logger.info(f"Обработка видео: {original_width}x{original_height} -> {target_width}x{target_height}")
             logger.info(f"Толщина рамки: {frame_thickness_info['name']} ({frame_thickness_info['description']})")
             
-            # Создаем FFmpeg pipeline с оптимизацией для скорости
+            # Создаем FFmpeg pipeline
             input_stream = ffmpeg.input(str(input_path))
             
             # Берём только видео поток
@@ -175,24 +174,23 @@ class VideoProcessor:
                                  resize_params['pad_top'],    # Отступ сверху (с учетом рамки)
                                  color=frame_color)
             
-            # ОПТИМИЗИРОВАННЫЕ настройки для скорости
+            # Сбалансированное качество - хорошее качество с разумным размером
             try:
                 # Пытаемся с аудио
                 output = ffmpeg.output(
                     padded, audio_stream,
                     str(output_path),
                     vcodec='libx264',
-                    crf=25,  # Немного снижено качество для скорости (было 23)
-                    preset='fast',  # УСКОРЕНИЕ: было 'medium'
+                    crf=23,  # Хорошее качество с разумным размером
+                    preset='medium',  # Баланс скорости и качества
                     acodec='aac',  # Кодек для аудио
                     audio_bitrate='128k',  # Качественное аудио
                     pix_fmt='yuv420p',  # Совместимость с большинством плееров
                     movflags='faststart',  # Быстрый старт воспроизведения
-                    tune='fastdecode',  # УСКОРЕНИЕ: оптимизация для быстрого декодирования
-                    **{'b:v': '1800k'},  # Увеличен битрейт для компенсации быстрого preset
-                    maxrate='2200k',  # Максимальный битрейт
-                    bufsize='4400k',   # Размер буфера
-                    threads='0'  # УСКОРЕНИЕ: использовать все доступные ядра
+                    tune='film',  # Оптимизация для видео контента
+                    **{'b:v': '1500k'},  # Более агрессивное ограничение битрейта
+                    maxrate='2000k',  # Максимальный битрейт
+                    bufsize='4000k'   # Размер буфера
                 )
             except:
                 # Если ошибка с аудио, то только видео
@@ -200,15 +198,14 @@ class VideoProcessor:
                     padded,
                     str(output_path),
                     vcodec='libx264',
-                    crf=25,  # Немного снижено качество для скорости
-                    preset='fast',  # УСКОРЕНИЕ
+                    crf=23,
+                    preset='medium',
                     pix_fmt='yuv420p',
                     movflags='faststart',
-                    tune='fastdecode',  # УСКОРЕНИЕ
-                    **{'b:v': '1800k'},
-                    maxrate='2200k',
-                    bufsize='4400k',
-                    threads='0'  # УСКОРЕНИЕ
+                    tune='film',
+                    **{'b:v': '1500k'},
+                    maxrate='2000k',
+                    bufsize='4000k'
                 )
             
             # Запускаем обработку
@@ -239,19 +236,16 @@ class VideoProcessor:
             return {'success': False, 'frame_color': None, 'frame_thickness': None, 'frame_thickness_px': None}
     
     async def create_multiple_variants(self, input_path: Path, output_dir: Path, count: int = 3) -> list:
-        """
-        Создает несколько вариантов видео с разным качеством/размером
-        ОПТИМИЗИРОВАНО ДЛЯ СКОРОСТИ И ПАРАЛЛЕЛЬНОСТИ
-        """
+        """Создает несколько вариантов видео с разным качеством/размером"""
         
-        # ОПТИМИЗИРОВАННЫЕ настройки качества для быстрой обработки
+        # Настройки качества для разных вариантов
         quality_settings = [
-            {"name": "Высокое", "crf": 20, "bitrate": "2000k", "maxrate": "2500k", "preset": "fast"},
-            {"name": "Среднее", "crf": 23, "bitrate": "1500k", "maxrate": "2000k", "preset": "fast"},
-            {"name": "Компактное", "crf": 26, "bitrate": "1000k", "maxrate": "1300k", "preset": "fast"},
-            {"name": "Минимальное", "crf": 28, "bitrate": "700k", "maxrate": "900k", "preset": "faster"},
-            {"name": "Ультра-компактное", "crf": 30, "bitrate": "500k", "maxrate": "600k", "preset": "faster"},
-            {"name": "Максимальное", "crf": 18, "bitrate": "2500k", "maxrate": "3000k", "preset": "fast"}
+            {"name": "Максимальное", "crf": 18, "bitrate": "2000k", "maxrate": "2500k"},
+            {"name": "Высокое", "crf": 21, "bitrate": "1500k", "maxrate": "2000k"},
+            {"name": "Среднее", "crf": 23, "bitrate": "1200k", "maxrate": "1500k"},
+            {"name": "Компактное", "crf": 25, "bitrate": "900k", "maxrate": "1200k"},
+            {"name": "Минимальное", "crf": 28, "bitrate": "600k", "maxrate": "800k"},
+            {"name": "Ультра-компактное", "crf": 30, "bitrate": "400k", "maxrate": "500k"}
         ]
         
         # Ограничиваем количество вариантов
@@ -264,7 +258,7 @@ class VideoProcessor:
             output_path = output_dir / f"variant_{i+1}_{settings['name'].lower()}.mp4"
             
             try:
-                logger.info(f"Создаю вариант {i+1}/{count}: {settings['name']} (preset: {settings['preset']})")
+                logger.info(f"Создаю вариант {i+1}/{count}: {settings['name']}")
                 
                 # Получаем информацию о видео
                 video_info = await self.get_video_info(input_path)
@@ -306,23 +300,22 @@ class VideoProcessor:
                                      resize_params['pad_top'],    # Отступ сверху (с учетом рамки)
                                      color=frame_color)
                 
-                # Создаем выходной поток с ОПТИМИЗИРОВАННЫМИ настройками качества
+                # Создаем выходной поток с настройками качества
                 if has_audio:
                     output = ffmpeg.output(
                         padded, audio_stream,
                         str(output_path),
                         vcodec='libx264',
                         crf=settings['crf'],
-                        preset=settings['preset'],  # Используем оптимизированный preset
+                        preset='medium',
                         acodec='aac',
                         audio_bitrate='128k',
                         pix_fmt='yuv420p',
                         movflags='faststart',
-                        tune='fastdecode',  # УСКОРЕНИЕ
+                        tune='film',
                         **{'b:v': settings['bitrate']},
                         maxrate=settings['maxrate'],
-                        bufsize=f"{int(settings['maxrate'][:-1]) * 2}k",
-                        threads='0'  # УСКОРЕНИЕ: использовать все ядра
+                        bufsize=f"{int(settings['maxrate'][:-1]) * 2}k"
                     )
                 else:
                     output = ffmpeg.output(
@@ -330,14 +323,13 @@ class VideoProcessor:
                         str(output_path),
                         vcodec='libx264',
                         crf=settings['crf'],
-                        preset=settings['preset'],  # Используем оптимизированный preset
+                        preset='medium',
                         pix_fmt='yuv420p',
                         movflags='faststart',
-                        tune='fastdecode',  # УСКОРЕНИЕ
+                        tune='film',
                         **{'b:v': settings['bitrate']},
                         maxrate=settings['maxrate'],
-                        bufsize=f"{int(settings['maxrate'][:-1]) * 2}k",
-                        threads='0'  # УСКОРЕНИЕ
+                        bufsize=f"{int(settings['maxrate'][:-1]) * 2}k"
                     )
                 
                 # Запускаем обработку
@@ -366,7 +358,7 @@ class VideoProcessor:
                         'frame_thickness': frame_thickness_info['name'],
                         'frame_thickness_px': frame_thickness_info['pixels']
                     })
-                    logger.info(f"Вариант {i+1} готов: {file_size:.1f}MB, рамка: {frame_thickness_info['name']}, preset: {settings['preset']}")
+                    logger.info(f"Вариант {i+1} готов: {file_size:.1f}MB, рамка: {frame_thickness_info['name']}")
                 
             except Exception as e:
                 logger.error(f"Ошибка создания варианта {i+1}: {e}")
